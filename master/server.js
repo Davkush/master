@@ -3,6 +3,40 @@ const cors    = require('cors');
 const Redis   = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
 
+// 🔁 CHECKPOINT ADDITION #1: Filesystem helpers for persistence
+const fs = require('fs');
+const path = require('path');
+
+const CHECKPOINT_DIR = process.env.CHECKPOINT_DIR || '/checkpoint';
+const CHECKPOINT_FILE = path.join(CHECKPOINT_DIR, 'puzzle71_checkpoint.json');
+
+if (!fs.existsSync(CHECKPOINT_DIR)) {
+  fs.mkdirSync(CHECKPOINT_DIR, { recursive: true });
+}
+
+function loadCheckpoint() {
+  try {
+    if (fs.existsSync(CHECKPOINT_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CHECKPOINT_FILE, 'utf8'));
+      console.log(`[✓] Loaded checkpoint: chunk ${data.lastChunkIndex}, scanned ${data.totalScanned}`);
+      return data;
+    }
+  } catch (err) {
+    console.error('[!] Failed to load checkpoint:', err.message);
+  }
+  return null;
+}
+
+function saveCheckpoint(lastChunkIndex, totalScanned) {
+  try {
+    const data = { lastChunkIndex, totalScanned, savedAt: new Date().toISOString() };
+    fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('[!] Failed to save checkpoint:', err.message);
+  }
+}
+// 🔁 END CHECKPOINT ADDITION #1
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -13,13 +47,28 @@ const RANGE_START    = BigInt('0x400000000000000000');
 const RANGE_END      = BigInt('0x7fffffffffffffffff');
 const TOTAL_KEYS     = RANGE_END - RANGE_START + 1n;
 
-// Each chunk = 2^40 keys (~1.1 trillion) — ~1h per worker per chunk on CPU
 const CHUNK_SIZE     = BigInt('0x10000000000'); // 2^40
 const TOTAL_CHUNKS   = Number((TOTAL_KEYS + CHUNK_SIZE - 1n) / CHUNK_SIZE);
 
 // ── Redis ─────────────────────────────────────────────────────────────────────
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 redis.on('error', err => console.error('[Redis]', err.message));
+
+// 🔁 CHECKPOINT ADDITION #2: Restore state on Redis connect
+redis.on('connect', async () => {
+  console.log('[✓] Connected to Redis');
+  const checkpoint = loadCheckpoint();
+  if (checkpoint) {
+    await redis.set('puzzle71:next_chunk', checkpoint.lastChunkIndex + 1);
+    await redis.set('puzzle71:total_scanned', checkpoint.totalScanned);
+    console.log(`[→] Resuming from chunk ${checkpoint.lastChunkIndex + 1}`);
+  } else {
+    await redis.set('puzzle71:next_chunk', 0);
+    await redis.set('puzzle71:total_scanned', 0);
+    console.log('[→] Starting fresh scan from chunk 0');
+  }
+});
+// 🔁 END CHECKPOINT ADDITION #2
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function chunkToRange(chunkIndex) {
@@ -35,9 +84,8 @@ function chunkToRange(chunkIndex) {
 }
 
 async function getNextChunkIndex() {
-  // next_chunk counter in Redis — atomic increment
   const idx = await redis.incr('puzzle71:next_chunk');
-  return idx - 1; // 0-based
+  return idx - 1;
 }
 
 async function markChunkDone(index, workerId) {
@@ -48,7 +96,6 @@ async function markChunkDone(index, workerId) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Worker calls this to get its next chunk assignment
 app.get('/range', async (req, res) => {
   try {
     const chunkIndex = await getNextChunkIndex();
@@ -58,7 +105,6 @@ app.get('/range', async (req, res) => {
     const range = chunkToRange(chunkIndex);
     const workerId = req.query.worker_id || uuidv4();
 
-    // Track assignment
     await redis.hset('puzzle71:assignments', chunkIndex.toString(), JSON.stringify({
       workerId, assignedAt: Date.now(), range
     }));
@@ -70,7 +116,6 @@ app.get('/range', async (req, res) => {
   }
 });
 
-// Worker calls this when chunk is complete (no key found)
 app.post('/done', async (req, res) => {
   const { chunk_index, worker_id, keys_checked } = req.body;
   await markChunkDone(chunk_index, worker_id);
@@ -80,7 +125,6 @@ app.post('/done', async (req, res) => {
   res.json({ status: 'ok', progress: pct });
 });
 
-// Worker calls this when it finds the key — THE MONEY CALL
 app.post('/found', async (req, res) => {
   const { private_key, worker_id, chunk_index } = req.body;
   const ts = new Date().toISOString();
@@ -89,17 +133,14 @@ app.post('/found', async (req, res) => {
   console.log('\n🔑🔑🔑 KEY FOUND 🔑🔑🔑');
   console.log(JSON.stringify(result, null, 2));
 
-  // Store permanently in Redis
   await redis.set('puzzle71:RESULT', JSON.stringify(result));
   await redis.lpush('puzzle71:result_log', JSON.stringify(result));
 
-  // Alert to stdout (Railway logs)
   process.stdout.write(`\n[CRITICAL] PUZZLE #71 SOLVED\nPrivate Key: ${private_key}\nWorker: ${worker_id}\nTime: ${ts}\n`);
 
   res.json({ status: 'ok', message: 'Key recorded. You found it!' });
 });
 
-// Stats dashboard
 app.get('/stats', async (req, res) => {
   const [nextChunk, scanned, result, workers] = await Promise.all([
     redis.get('puzzle71:next_chunk'),
@@ -129,7 +170,6 @@ app.get('/stats', async (req, res) => {
   });
 });
 
-// Simple HTML dashboard
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
@@ -156,7 +196,52 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
+// 🔁 CHECKPOINT ADDITION #3: Periodic checkpoint saves (every 30s)
+setInterval(async () => {
+  try {
+    const nextChunk = await redis.get('puzzle71:next_chunk');
+    const scanned = await redis.get('puzzle71:total_scanned');
+    if (nextChunk) {
+      saveCheckpoint(parseInt(nextChunk) - 1, parseInt(scanned || 0));
+    }
+  } catch (err) {
+    console.error('[!] Checkpoint save error:', err.message);
+  }
+}, 30000);
+// 🔁 END CHECKPOINT ADDITION #3
+
 // ── Start ─────────────────────────────────────────────────────────────────────
+
+// 🔁 CHECKPOINT ADDITION #4: Graceful shutdown handlers
+process.on('SIGTERM', async () => {
+  console.log('[!] SIGTERM received, saving checkpoint...');
+  try {
+    const nextChunk = await redis.get('puzzle71:next_chunk');
+    const scanned = await redis.get('puzzle71:total_scanned');
+    if (nextChunk) {
+      saveCheckpoint(parseInt(nextChunk) - 1, parseInt(scanned || 0));
+    }
+  } catch (err) {
+    console.error('[!] Final checkpoint save failed:', err.message);
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('[!] SIGINT received, saving checkpoint...');
+  try {
+    const nextChunk = await redis.get('puzzle71:next_chunk');
+    const scanned = await redis.get('puzzle71:total_scanned');
+    if (nextChunk) {
+      saveCheckpoint(parseInt(nextChunk) - 1, parseInt(scanned || 0));
+    }
+  } catch (err) {
+    console.error('[!] Final checkpoint save failed:', err.message);
+  }
+  process.exit(0);
+});
+// 🔁 END CHECKPOINT ADDITION #4
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
